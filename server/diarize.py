@@ -40,8 +40,7 @@ MEMORY_LAYOUT = load_memory_layout(ROOT)
 WHISPER_URL = (os.environ.get("STT_URL") or os.environ.get("WHISPER_URL")
                or "http://127.0.0.1:8080/inference")
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
-AUDIO_DIR = Path(os.environ.get("AUDIO_BRIDGE_DIR",
-                                os.environ.get("AUDIO_BRIDGE_DIR", ROOT / "audio")))
+AUDIO_DIR = Path(os.environ.get("AUDIO_BRIDGE_DIR", ROOT / "audio"))
 REF_DEFAULT = MEMORY_LAYOUT.owner_assets / "voice_profile.wav"
 INBOX = MEMORY_LAYOUT.owner_base / "INBOX"
 VOICES = MEMORY_LAYOUT.owner_assets / "voices"  # operational, not part of a memory epoch

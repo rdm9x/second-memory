@@ -49,29 +49,29 @@ try:                       # C-скорость; в Python 3.13 модуль у�
 except Exception:          # pragma: no cover — запасной путь на будущее
     audioop = None
 
-def _setting(name: str, legacy: str, default):
-    return os.environ.get(name, os.environ.get(legacy, default))
+def _setting(name: str, default):
+    return os.environ.get(name, default)
 
 
-SAMPLE_RATE = int(_setting("AUDIO_BRIDGE_SAMPLE_RATE", "AUDIO_BRIDGE_SAMPLE_RATE", 16000))
+SAMPLE_RATE = int(_setting("AUDIO_BRIDGE_SAMPLE_RATE", 16000))
 
 # Окно 100 мс: короче — шумит на отдельных слогах, длиннее — теряет короткие реплики.
-WIN_MS = int(_setting("AUDIO_BRIDGE_GATE_WIN_MS", "AUDIO_BRIDGE_GATE_WIN_MS", 100))
+WIN_MS = int(_setting("AUDIO_BRIDGE_GATE_WIN_MS", 100))
 # Во сколько раз окно должно превысить фон, чтобы считаться речью.
-RATIO = float(_setting("AUDIO_BRIDGE_GATE_RATIO", "AUDIO_BRIDGE_GATE_RATIO", 2.2))
+RATIO = float(_setting("AUDIO_BRIDGE_GATE_RATIO", 2.2))
 # Добавка к порогу — страховка на случай очень тихого фона (тихая переговорная,
 # где пол ~110: без добавки порогом стало бы 240 и в речь пролезал бы шорох).
-MARGIN = float(_setting("AUDIO_BRIDGE_GATE_MARGIN", "AUDIO_BRIDGE_GATE_MARGIN", 310))
+MARGIN = float(_setting("AUDIO_BRIDGE_GATE_MARGIN", 310))
 # Ниже этого RMS речи не бывает ни при каком фоне (защита от «цифровой тишины»).
-ABS_MIN = float(_setting("AUDIO_BRIDGE_GATE_ABS_MIN", "AUDIO_BRIDGE_GATE_ABS_MIN", 250))
+ABS_MIN = float(_setting("AUDIO_BRIDGE_GATE_ABS_MIN", 250))
 # Сколько окон должно быть «громкими»: 4 окна = 0,4 с речи в 8-секундном куске.
-MIN_WINS = int(_setting("AUDIO_BRIDGE_GATE_MIN_WINS", "AUDIO_BRIDGE_GATE_MIN_WINS", 4))
+MIN_WINS = int(_setting("AUDIO_BRIDGE_GATE_MIN_WINS", 4))
 # Скорость слежения за фоном: вниз быстро, вверх медленно.
-DOWN = float(_setting("AUDIO_BRIDGE_GATE_DOWN", "AUDIO_BRIDGE_GATE_DOWN", 0.35))
-UP = float(_setting("AUDIO_BRIDGE_GATE_UP", "AUDIO_BRIDGE_GATE_UP", 0.08))
+DOWN = float(_setting("AUDIO_BRIDGE_GATE_DOWN", 0.35))
+UP = float(_setting("AUDIO_BRIDGE_GATE_UP", 0.08))
 # Границы фона — чтобы оценка не убежала ни в ноль, ни в бесконечность.
-FLOOR_MIN = float(_setting("AUDIO_BRIDGE_GATE_FLOOR_MIN", "AUDIO_BRIDGE_GATE_FLOOR_MIN", 50))
-FLOOR_MAX = float(_setting("AUDIO_BRIDGE_GATE_FLOOR_MAX", "AUDIO_BRIDGE_GATE_FLOOR_MAX", 5000))
+FLOOR_MIN = float(_setting("AUDIO_BRIDGE_GATE_FLOOR_MIN", 50))
+FLOOR_MAX = float(_setting("AUDIO_BRIDGE_GATE_FLOOR_MAX", 5000))
 
 
 def window_rms(pcm: bytes, win_ms: int = WIN_MS) -> list[float]:

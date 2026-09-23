@@ -5,8 +5,9 @@
    кусками гоняет через локальный whisper-server (:8080/inference) и возвращает
    сегменты в формате openAI/whisper verbose_json, который ждёт приложение.
 
-Канонический entrypoint: audio_bridge.py. Это имя файла — временный
-совместимый алиас до гейта миграции, не раньше 15.10.2026.
+Ядро моста. Служба `dima-audio-bridge` запускает точку входа audio_bridge.py,
+она зовёт `run()` отсюда. Настройки — только `AUDIO_BRIDGE_*` из .env; заголовки
+протокола приложения и их временные алиасы — audio_bridge_protocol.py (BE-64).
 """
 import asyncio
 import base64
@@ -29,8 +30,10 @@ from dotenv import load_dotenv
 
 from assistant_settings import load_state, save_state, set_wake_phrase, wake_phrase, wake_words
 from audio_bridge_protocol import (AssistantCommandWindow, CommandWindowRegistry,
-                                   ControlMessageError, INVOKE_TYPE, invoke_ack,
-                                   parse_control_message)
+                                   ControlMessageError, HEADER_CAPTURE_ID,
+                                   HEADER_SYNC_CAPTURE_MANIFEST, HEADER_SYNC_LANE_HINT,
+                                   INVOKE_TYPE, invoke_ack, parse_control_message,
+                                   request_header)
 from conversation_finalization import (ConversationFinalizationStore, FinalizationError,
                                        canonical_conversation_id)
 from memory_epoch import load_memory_layout
@@ -49,12 +52,12 @@ TZ = ZoneInfo("Europe/Moscow")
 MEMORY_LAYOUT = load_memory_layout(Path(__file__).parent)
 INBOX = MEMORY_LAYOUT.owner_base / "INBOX"
 INBOX.mkdir(parents=True, exist_ok=True)
-KEY = os.environ.get("AUDIO_BRIDGE_KEY", os.environ.get("AUDIO_BRIDGE_KEY", ""))
+KEY = os.environ.get("AUDIO_BRIDGE_KEY", "")
 # Список носителей приложения-форка (uid из его настроек), через запятую.
 # Пусто = пускаем любой uid (путь и так за секретом в базовом URL).
 V4_UIDS = {u.strip() for u in os.environ.get(
-    "AUDIO_BRIDGE_UIDS", os.environ.get("AUDIO_BRIDGE_UIDS", "")).split(",") if u.strip()}
-PORT = int(os.environ.get("AUDIO_BRIDGE_PORT", os.environ.get("AUDIO_BRIDGE_PORT", 8899)))
+    "AUDIO_BRIDGE_UIDS", "").split(",") if u.strip()}
+PORT = int(os.environ.get("AUDIO_BRIDGE_PORT", 8899))
 
 
 def slug(text: str, limit: int = 40) -> str:
@@ -167,8 +170,7 @@ async def handle_voice_command(request: web.Request) -> web.Response:
 
 # ---------- WebSocket-мост live-STT ----------
 
-SAMPLE_RATE = int(os.environ.get("AUDIO_BRIDGE_SAMPLE_RATE",
-                                 os.environ.get("AUDIO_BRIDGE_SAMPLE_RATE", 16000)))
+SAMPLE_RATE = int(os.environ.get("AUDIO_BRIDGE_SAMPLE_RATE", 16000))
 # Голосовые команды: услышав wake-слово, мост собирает команду (текущий +
 # следующий чанк) и кладёт в файл — бот подхватывает его раз в 5 секунд.
 # Позывной — «Ватсон» / «Доктор Ватсон» (выбор Димы 12.07.2026). Подстрока
@@ -187,15 +189,13 @@ WHISPER_URL = os.environ.get("STT_URL") or "http://127.0.0.1:8080/inference"
 # Разговор = звук с паузами < AUDIO_GAP_SEC; закрывается по длинной тишине
 # или по такой же паузе в пакетах. Короткий WS-реконнект файл не режет.
 # Тишина ДО начала речи не пишется.
-AUDIO_DIR = Path(os.environ.get("AUDIO_BRIDGE_DIR",
-                                os.environ.get("AUDIO_BRIDGE_DIR", Path(__file__).parent / "audio")))
+AUDIO_DIR = Path(os.environ.get("AUDIO_BRIDGE_DIR", Path(__file__).parent / "audio"))
 SYNC_STORE = SyncFileStore(Path(os.environ.get(
     "AUDIO_BRIDGE_SYNC_SPOOL", Path(__file__).parent.parent / "sync-upload")))
 FINALIZATION_STORE = ConversationFinalizationStore(
     SYNC_STORE.root / "conversation-finalization.sqlite3")
 _SYNC_PREPARE_TASKS: dict[str, asyncio.Task] = {}
-AUDIO_GAP_SEC = int(os.environ.get("AUDIO_BRIDGE_GAP_SEC",
-                                   os.environ.get("AUDIO_BRIDGE_GAP_SEC", 90)))
+AUDIO_GAP_SEC = int(os.environ.get("AUDIO_BRIDGE_GAP_SEC", 90))
 # Product decision 20.09: accepted audio is retained indefinitely by default.
 # A legacy positive value alone is ignored. Deletion additionally requires
 # AUDIO_BRIDGE_RETENTION_DELETE_ENABLED=1; otherwise every accepted WAV stays.
@@ -267,17 +267,15 @@ def pcm_to_wav(pcm: bytes) -> bytes:
 
 # 22.07: прошивка mod5-gain подняла уровни WAV на +8 дБ (×2.5 по амплитуде) —
 # пороги умножены соответственно (было 200 и 900 под старый gain)
-SILENCE_THRESHOLD = int(os.environ.get("AUDIO_BRIDGE_SILENCE_THRESHOLD",
-                                       os.environ.get("AUDIO_BRIDGE_SILENCE_THRESHOLD", 500)))
+SILENCE_THRESHOLD = int(os.environ.get("AUDIO_BRIDGE_SILENCE_THRESHOLD", 500))
 
 # BE-21 (26.08): слух моста переведён на speech_gate — порог считается от
 # СОБСТВЕННОГО шумового пола потока, а не от общей константы. Причина: с
 # непрерывным захватом (PORT-7) константа 500 ломается с обеих сторон — в
 # тихой переговорной топит дальнюю речь, в обычной комнате (пол сам ~950)
 # не находит тишины НИКОГДА. Замеры — roles/backend/METHODS.md, «Слух моста».
-# Откат: AUDIO_BRIDGE_GATE=old; legacy AUDIO_BRIDGE_GATE пока тоже читается.
-USE_NEW_GATE = os.environ.get("AUDIO_BRIDGE_GATE",
-                              os.environ.get("AUDIO_BRIDGE_GATE", "new")).strip().lower() != "old"
+# Откат: AUDIO_BRIDGE_GATE=old.
+USE_NEW_GATE = os.environ.get("AUDIO_BRIDGE_GATE", "new").strip().lower() != "old"
 
 
 def is_silence(pcm: bytes, threshold: int = SILENCE_THRESHOLD) -> bool:
@@ -598,10 +596,8 @@ class ConversationRecorder:
         _cleanup_old_audio()
 
 
-# Legacy metadata is intentionally left on disk for audit/rollback, but it is
-# no longer read or appended.  The removed voice phrase was destructive and
-# ambiguous; privacy is now controlled only by the explicit microphone switch.
-SKIP_WINDOWS_FILE = Path(__file__).parent / "bridge_skip_windows.json"
+# The removed voice «skip» phrase was destructive and ambiguous; privacy is now
+# controlled only by the explicit microphone switch.
 
 
 def _cleanup_old_audio():
@@ -695,11 +691,6 @@ def app_segments(result: dict) -> str:
         "speech_profile_processed": True,
         "stt_provider": "gigaam",
     } for i, s in enumerate(result["segments"])], ensure_ascii=False)
-
-
-# Compatibility import for old local tools; remove after the migration gate,
-# not before 2026-10-15.
-app_segments = app_segments
 
 
 class NullRecorder:
@@ -1081,7 +1072,7 @@ async def handle_sync_local_files(request: web.Request, uid: str, carrier: str,
         return web.json_response({"error": "batch_too_large"}, status=413)
     stage = None
     try:
-        capture_id = request.headers.get("X-Pomnit-Capture-Id")
+        capture_id = request_header(request.headers, HEADER_CAPTURE_ID)
         if capture_id is not None:
             try:
                 capture_id = canonical_conversation_id(capture_id)
@@ -1131,8 +1122,8 @@ async def handle_sync_local_files(request: web.Request, uid: str, carrier: str,
         if not files:
             raise IntakeError("empty_upload")
         conversation_id = capture_id or request.query.get("conversation_id")
-        lane = request.headers.get("X-Pomnit-Sync-Lane-Hint", "backfill")
-        manifest = request.headers.get("X-Pomnit-Sync-Capture-Manifest")
+        lane = request_header(request.headers, HEADER_SYNC_LANE_HINT, "backfill")
+        manifest = request_header(request.headers, HEADER_SYNC_CAPTURE_MANIFEST)
         if conversation_id is not None and lane == "fresh" and not manifest:
             raise IntakeError("capture_manifest_required")
         if manifest:
@@ -1880,12 +1871,11 @@ async def _live_session(request: web.Request, app_protocol: bool) -> web.WebSock
 # (граница данных, решение 30.07). Свою базу каждому заведём отдельным шагом (C5).
 # Соответствие «uid = имя» — в .env: AUDIO_BRIDGE_CARRIERS=uid1=dima,uid2=carrier2
 CARRIERS = {}
-for pair in os.environ.get("AUDIO_BRIDGE_CARRIERS",
-                           os.environ.get("AUDIO_BRIDGE_CARRIERS", "")).split(","):
+for pair in os.environ.get("AUDIO_BRIDGE_CARRIERS", "").split(","):
     if "=" in pair:
         _uid, _name = pair.split("=", 1)
         CARRIERS[_uid.strip()] = _name.strip()
-OWNER = os.environ.get("AUDIO_BRIDGE_OWNER", os.environ.get("AUDIO_BRIDGE_OWNER", "dima"))
+OWNER = os.environ.get("AUDIO_BRIDGE_OWNER", "dima")
 RECORDERS: dict[str, ConversationRecorder] = {}
 FINALIZATION_UIDS: dict[str, str] = {}
 WAKES = CommandWindowRegistry()
@@ -1895,7 +1885,7 @@ WAKES = CommandWindowRegistry()
 # проверить, что доезжает и распознаётся, — но это не жизнь человека: ни ночного
 # разбора, ни карточек, ни копилки голосов. Список uid — в AUDIO_BRIDGE_STEND_UIDS.
 STEND_UIDS = {u.strip() for u in os.environ.get(
-    "AUDIO_BRIDGE_STEND_UIDS", os.environ.get("AUDIO_BRIDGE_STEND_UIDS", "")).split(",") if u.strip()}
+    "AUDIO_BRIDGE_STEND_UIDS", "").split(",") if u.strip()}
 
 # ЗАПЛАТКА 18.08.2026 СНЯТА В ТОТ ЖЕ ДЕНЬ — история оставлена как урок.
 # Была нужна с 16:42 до 18:05 18.08. Плата nRF54L15 стала БОЕВЫМ кулоном Димы
@@ -1906,10 +1896,10 @@ STEND_UIDS = {u.strip() for u in os.environ.get(
 # корзину (audio-stend-nrf54-01), мимо карточек, дневника и копилки голосов.
 # Заплатка на время отдавала стендовый uid владельцу.
 # СНЯТА, потому что вылечен ИСТОЧНИК, а не симптом: сборка форка 1.0.543 (993)
-# от 18.08 (коммит 83952f0 в ~/dev/pomnit-app) выкинула константу knownStendIds
+# от 18.08 (коммит 83952f0 в репозитории приложения) выкинула константу knownStendIds
 # совсем и разовой миграцией вычистила stendDeviceIds из хранилища телефона.
 # Приёмка перед снятием — по логу, а не на веру: в 18:02:47 пошло
-# «v4: подключение uid=owner-app-uid», то есть поток кулона
+# «v4: подключение uid=<uid владельца>», то есть поток кулона
 # приходит под uid Димы сам, без подмены.
 # Флаг НЕ удалён намеренно: появится настоящее второе стендовое устройство —
 # ветка ниже снова уведёт его в свою корзину, как и задумано.
