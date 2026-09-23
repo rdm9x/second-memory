@@ -1,22 +1,22 @@
-r"""GigaAM-сервер (:8081) — STT русской речи, альтернатива whisper-server.
+r"""GigaAM-сервер (:8081) — альтернативный STT для теста против whisper-server.
 
 Модель: GigaAM v3 (Сбер, https://github.com/salute-developers/GigaAM), SOTA на
 русском, MIT. По умолчанию v3_e2e_rnnt — с пунктуацией и нормализацией.
 
 API повторяет whisper-server ровно настолько, насколько им пользуются наши
-клиенты (мост audio_bridge_core.py и diarize.py):
+клиенты (аудиомост и diarize.py):
   POST /inference  multipart, поле file (WAV) → {"text", "segments":[{text,start,end}]}
   GET  /           строка статуса (для curl-проверок и сторожей)
 Лишние поля формы (response_format, temperature, prompt) принимаются и
 игнорируются — у GigaAM нет промпта.
 
-Переключение конвейера: STT_URL=http://127.0.0.1:8081/inference в .env →
-перезапуск службы моста (и службы ассистента, чтобы ночная диаризация получила
-тот же URL). Откат: убрать STT_URL, перезапустить те же службы.
+Переключение прода: STT_URL=http://127.0.0.1:8081/inference в .env → перезапуск
+служба аудиомоста (+ dima-assistant, чтобы diar_job передал URL диаризации).
+Откат: убрать STT_URL, перезапустить те же службы. Рецепт — handover/RUNBOOK.md.
 
-Запуск (venv с gigaam): python gigaam_server.py
+Запуск (home-pc, служба dima-gigaam): venv-gigaam\Scripts\python.exe gigaam_server.py
 Ограничение transcribe — 25 с; длиннее режем на окна по 24 с (longform-режим
-GigaAM требует torchcodec, который на Windows не заводится).
+GigaAM требует torchcodec, который на Windows мёртв — грабля 13.07).
 """
 import asyncio
 import io
@@ -28,8 +28,8 @@ from pathlib import Path
 
 from aiohttp import web
 
-# gigaam.load_audio зовёт ffmpeg из PATH; в PATH службы Windows его нет —
-# добавляем каталог из FFMPEG_DIR (задаётся при установке службы) в начало PATH.
+# gigaam.load_audio зовёт ffmpeg из PATH; в PATH службы NSSM его нет — добавляем
+# каталог из FFMPEG_DIR (задаётся в install_gigaam_service.ps1) в начало PATH.
 _FFMPEG_DIR = os.environ.get("FFMPEG_DIR", "")
 if _FFMPEG_DIR:
     os.environ["PATH"] = _FFMPEG_DIR + os.pathsep + os.environ.get("PATH", "")
@@ -62,7 +62,7 @@ def _split_wav(data: bytes) -> list[tuple[bytes, float, float]]:
         out = []
         pos = 0
         step = WINDOW_SEC * sr
-        min_frames = sr // 2  # окна короче 0.5 с роняют stft модели (n_fft=320)
+        min_frames = sr // 2  # R1-8: окна короче 0.5 с роняют stft модели (n_fft=320)
         while pos < total:
             n = min(step, total - pos)
             frames = w.readframes(n)
@@ -87,7 +87,7 @@ def _transcribe_blocking(data: bytes) -> dict:
         try:
             tmp.write(wav_bytes)
             tmp.close()
-            # одно битое окно не должно ронять весь файл — раньше исключение
+            # R1-8: одно битое окно не должно ронять весь файл — раньше исключение
             # уходило 500-кой и терялся ЦЕЛИКОМ кусок дня; теперь окно пропускается
             try:
                 text = str(_MODEL.transcribe(tmp.name)).strip()
@@ -126,6 +126,6 @@ app.router.add_post("/inference", handle_inference)
 app.router.add_get("/", handle_ping)
 
 if __name__ == "__main__":
-    _load_model()  # падаем сразу, если модель не встала — менеджер служб перезапустит
+    _load_model()  # падаем сразу, если модель не встала — NSSM перезапустит
     print(f"gigaam-server: слушаю 127.0.0.1:{PORT}", flush=True)
     web.run_app(app, host="127.0.0.1", port=PORT, print=None)

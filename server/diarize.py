@@ -1,20 +1,18 @@
 r"""Диаризация разговора: WAV → «кто что сказал» (markdown).
 
-Конвейер: pyannote (спикер-интервалы, GPU) + STT-сервер :8080 (текст с
-таймкодами) → мерж по перекрытию → метка «Владелец» по эталону голоса.
-Голоса собеседников копятся накопительно: каждый разговор оставляет отпечатки
-кластеров, ночное обучение подтверждает имена по контексту —
-система со временем узнаёт окружение владельца по голосу.
+Конвейер: pyannote (спикер-интервалы, GPU) + whisper-server :8080 (текст с
+таймкодами) → мерж по перекрытию → метка «Дима» по эталону голоса.
 
-Запуск (в venv диаризации):
-    python diarize.py audio\2026-07-12_213012.wav
+Запуск (на home-pc, venv-diar):
+    venv-diar\Scripts\python.exe diarize.py audio\2026-07-12_213012.wav
     ... --all            # все необработанные WAV из audio/
     ... --ref voice.wav  # свой эталон (по умолчанию base/voice_profile.wav)
 
 Требует в .env: HF_TOKEN (read-токен HuggingFace, условия моделей приняты:
 pyannote/speaker-diarization-3.1 и pyannote/segmentation-3.0).
 Результат: <имя>.speakers.md рядом с WAV + копия в base/INBOX/ (разберёт ночной
-разбор). Повторный прогон файла с готовым .speakers.md пропускается.
+разбор) и immutable <имя>.speakers.json с точными sample-границами.
+Повторный прогон файла с готовым .speakers.md пропускается.
 """
 import argparse
 import io
@@ -24,6 +22,7 @@ import re
 import sys
 import urllib.request
 import wave
+from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).parent
@@ -31,25 +30,27 @@ sys.path.insert(0, str(ROOT))
 
 from dotenv import load_dotenv
 from hallucinations import is_hallucination
+from memory_epoch import load_memory_layout
+from pomnit_transcript_sidecar import inspect_wav, load_for_wav, sidecar_path, write_for_wav
 
 load_dotenv(ROOT / ".env")
+MEMORY_LAYOUT = load_memory_layout(ROOT)
 
 # STT_URL — общий переключатель STT (whisper :8080 / gigaam :8081), как в мосте.
 WHISPER_URL = (os.environ.get("STT_URL") or os.environ.get("WHISPER_URL")
                or "http://127.0.0.1:8080/inference")
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
-AUDIO_DIR = Path(os.environ.get("AUDIO_BRIDGE_DIR", ROOT / "audio"))
-REF_DEFAULT = ROOT / "base" / "voice_profile.wav"
-INBOX = ROOT / "base" / "INBOX"
-VOICES = ROOT / "base" / "voices"          # выученные голоса: <имя>.json (voice_learn)
+AUDIO_DIR = Path(os.environ.get("AUDIO_BRIDGE_DIR",
+                                os.environ.get("AUDIO_BRIDGE_DIR", ROOT / "audio")))
+REF_DEFAULT = MEMORY_LAYOUT.owner_assets / "voice_profile.wav"
+INBOX = MEMORY_LAYOUT.owner_base / "INBOX"
+VOICES = MEMORY_LAYOUT.owner_assets / "voices"  # operational, not part of a memory epoch
 EMB_DIR = VOICES / "embeddings"            # отпечатки кластеров каждого разговора
-SIM_THRESHOLD = 0.4  # косинусная близость к эталону, ниже — «не владелец»
-
-OWNER_LABEL = "Владелец"   # метка хозяина дневника в расшифровках
+SIM_THRESHOLD = 0.4  # косинусная близость к эталону, ниже — «не Дима»
 
 
 def transcribe(path: Path) -> list[dict]:
-    """STT-сервер → сегменты [{text,start,end}]. multipart руками, без requests."""
+    """whisper-server → сегменты [{text,start,end}]. multipart руками, без requests."""
     boundary = "----diarize-boundary"
     body = io.BytesIO()
 
@@ -91,20 +92,59 @@ def load_audio(path: Path) -> dict:
     return {"waveform": wf, "sample_rate": sr}
 
 
-def transcribe_span(path: Path, start: float, end: float) -> str:
+@dataclass(frozen=True)
+class _SttPcmWindow:
+    """Exact source samples copied into the temporary WAV sent to STT."""
+
+    sample_rate: int
+    start_sample: int
+    end_sample: int
+    frames: bytes
+
+
+def _stt_pcm_window(path: Path, start: float, end: float) -> _SttPcmWindow:
+    """Read exactly the clamped PCM window used by ``transcribe_span``.
+
+    ``wave.readframes`` may return fewer frames at EOF.  Deriving ``end_sample``
+    from the bytes actually read makes the sidecar evidence range match the STT
+    input rather than the unclamped pyannote turn.
+    """
+    with wave.open(str(path)) as source:
+        sample_rate = source.getframerate()
+        frame_count = source.getnframes()
+        frame_bytes = source.getnchannels() * source.getsampwidth()
+        start_sample = min(frame_count, int(max(0.0, start) * sample_rate))
+        requested_frames = int(max(0.2, end - start) * sample_rate)
+        source.setpos(start_sample)
+        frames = source.readframes(requested_frames)
+    if frame_bytes <= 0 or len(frames) % frame_bytes:
+        raise ValueError("WAV returned an incomplete PCM frame")
+    actual_frames = len(frames) // frame_bytes
+    return _SttPcmWindow(
+        sample_rate=sample_rate,
+        start_sample=start_sample,
+        end_sample=start_sample + actual_frames,
+        frames=frames,
+    )
+
+
+def transcribe_span(
+    path: Path,
+    start: float,
+    end: float,
+    *,
+    pcm_window: _SttPcmWindow | None = None,
+) -> str:
     """Расшифровка ОДНОГО интервала (реплики по pyannote). Целый длинный файл
-    whisper.cpp не переваривает: после минут шума уходит в петлю галлюцинаций,
-    а на коротких кусках работает отлично."""
-    with wave.open(str(path)) as w:
-        sr = w.getframerate()
-        w.setpos(int(max(0.0, start) * sr))
-        frames = w.readframes(int(max(0.2, end - start) * sr))
+    whisper.cpp не переваривает: после минут шума уходит в петлю галлюцинаций
+    (грабля 13.07), а на коротких кусках работает отлично."""
+    window = pcm_window or _stt_pcm_window(path, start, end)
     buf = io.BytesIO()
     with wave.open(buf, "wb") as o:
         o.setnchannels(1)
         o.setsampwidth(2)
-        o.setframerate(sr)
-        o.writeframes(frames)
+        o.setframerate(window.sample_rate)
+        o.writeframes(window.frames)
     boundary = "----diarize-boundary"
     body = io.BytesIO()
     for name, value in (("response_format", "json"), ("temperature", "0.0")):
@@ -174,7 +214,7 @@ def diarize(path: Path):
 
 
 def _ref_embedding(ref: Path):
-    """Нормированный эмбеддинг эталона голоса владельца (или None)."""
+    """Нормированный эмбеддинг эталона голоса Димы (или None)."""
     if not (ref.exists() and HF_TOKEN):
         return None
     try:
@@ -187,17 +227,21 @@ def _ref_embedding(ref: Path):
 
 
 def _voice_library(ref: Path) -> dict:
-    """Все известные голоса: владелец (wav-эталон) + выученные из base/voices/*.json
-    (их копит voice_learn по подтверждениям из контекста разговоров)."""
+    """Подтверждённые голоса: эталон Димы + только owner_manual JSON.
+
+    Старые профили, которые voice_learn создавал из контекстных догадок,
+    остаются на диске для аудита, но не могут приписать чужую реплику человеку.
+    """
     import numpy as np
     lib = {}
-    owner = _ref_embedding(ref)
-    if owner is not None:
-        lib[OWNER_LABEL] = owner
+    dima = _ref_embedding(ref)
+    if dima is not None:
+        lib["Дима"] = dima
     for f in sorted(VOICES.glob("*.json")):
         try:
             d = json.loads(f.read_text(encoding="utf-8"))
-            if "name" not in d or "embedding" not in d:
+            if ("name" not in d or "embedding" not in d or
+                    d.get("confirmation") != "owner_manual"):
                 continue  # служебные файлы (learn_state.json и пр.) — не голоса
             v = np.array(d["embedding"], dtype=float)
             lib[d["name"]] = v / np.linalg.norm(v)
@@ -229,8 +273,8 @@ def identify_speakers(embs: dict, library: dict) -> dict:
 def merge_speakers(path: Path, turns, embs=None, protected=None):
     """Схлопывает ложные кластеры: в шумном многолюдном помещении pyannote дробит
     один голос на несколько SPEAKER. Сливает пары с косинусной близостью > MERGE_SIM
-    (по связности). protected (кластер владельца) НЕ сливается ни с кем — его
-    метка защищена от растворения агрессивной склейкой."""
+    (по связности). protected (кластер Димы) НЕ сливается ни с кем — метка «Дима»
+    защищена от растворения агрессивной склейкой."""
     import numpy as np
     if embs is None:
         embs = speaker_embeddings(path, turns)
@@ -250,7 +294,7 @@ def merge_speakers(path: Path, turns, embs=None, protected=None):
         for j in range(i + 1, len(spks)):
             a, b = spks[i], spks[j]
             if a in protected or b in protected:
-                continue  # опознанные (владелец и выученные голоса) ни с кем не сливаем
+                continue  # опознанных (Дима и выученные голоса) ни с кем не сливаем
             if float(np.dot(embs[a], embs[b])) > MERGE_SIM:
                 parent[find(a)] = find(b)
     remap = {s: find(s) for s in spks}
@@ -308,9 +352,8 @@ def label_speakers(turns, named: dict) -> dict:
 
 def export_embeddings(stem: str, turns, embs: dict, names: dict) -> None:
     """Отпечатки голосов разговора → base/voices/embeddings/<stem>.json —
-    сырьё для voice_learn (обучение новых голосов по контексту). Ключи —
-    итоговые лейблы («Владелец», «Голос 2»…), эмбеддинги слитых кластеров
-    усредняются."""
+    сырьё для voice_learn.py (обучение новых голосов по контексту). Ключи —
+    итоговые лейблы («Дима», «Голос 2»…), эмбеддинги слитых кластеров усредняются."""
     import numpy as np
     by_label: dict[str, list] = {}
     speech: dict[str, float] = {}
@@ -336,7 +379,7 @@ def _norm_echo(s: str) -> str:
 
 
 def _dedupe_echo(pairs: list) -> list:
-    """«Эхо» на границах реплик — конец фразы спикера A повторяется в начале
+    """R3-4: «эхо» на границах реплик — конец фразы спикера A повторяется в начале
     реплики B (перекрытие окон распознавания). По аудиту 8-12% реплик. Если
     нормализованный хвост A (≥15 знаков) совпадает с началом B — режем повтор из B."""
     out = []
@@ -362,24 +405,69 @@ def _dedupe_echo(pairs: list) -> list:
     return out
 
 
+def _legacy_markdown(stamp: str, participants: list[str], turns: list[dict],
+                     empty_label: str | None = None) -> str:
+    if not turns:
+        return f"# Разговор {stamp}: {empty_label or 'речи не найдено'}\n"
+    md = "\n\n".join(
+        f"**{turn['speaker_label']}:** {turn['text']}" for turn in turns)
+    header = (f"# Разговор {stamp} (диаризация)\n\n"
+              f"Участники: {', '.join(participants)}\n\n")
+    return header + md + "\n"
+
+
+def _publish_legacy_markdown(path: Path, text: str) -> None:
+    """Preserve the existing Markdown output after the sidecar is durable."""
+    out = path.with_suffix(".speakers.md")
+    out.write_text(text, encoding="utf-8")
+    if INBOX.exists():
+        (INBOX / f"{path.stem}_diarized.md").write_text(text, encoding="utf-8")
+        mark_webhook_duplicates(path.stem)
+
+
 # ПОЧЕМУ ЗДЕСЬ НЕТ РАЗРЕЗА СЛИПШИХСЯ РЕПЛИК: process() распознаёт КАЖДЫЙ
 # отрезок диаризации отдельно (transcribe_span), поэтому текст двух людей
 # в один кусок не попадает. Реальная причина «слипшихся» абзацев — расширение
 # границ отрезка (start-0.25 / end+0.4): в кусок попадает хвост соседа. Лечит
-# это _dedupe_echo, который применяется к готовым репликам ниже.
+# это _dedupe_echo, который применяется к готовым репликам ниже (07.08).
 
 def process(path: Path, ref: Path) -> bool:
     out = path.with_suffix(".speakers.md")
+    exact = sidecar_path(path)
     if out.exists():
+        # A new-format output must still prove that its immutable sidecar names
+        # these exact WAV bytes.  Old Markdown without a sidecar is deliberately
+        # left alone and is never retro-imported.
+        if exact.exists():
+            load_for_wav(exact, path)
         return False
+    if exact.exists():
+        # Crash recovery: sidecar publication precedes legacy Markdown.  Rebuild
+        # the latter without another STT/model pass and without changing JSON.
+        payload = load_for_wav(exact, path)
+        turns = payload["turns"]
+        participants = list(dict.fromkeys(
+            turn["speaker_label"] for turn in turns))
+        empty = {
+            "no_speech": "речи не найдено",
+            "no_clear_speech": "внятной речи не найдено",
+        }.get(payload["coverage"]["status"])
+        _publish_legacy_markdown(
+            path, _legacy_markdown(path.stem, participants, turns, empty))
+        return bool(turns)
+    source_fingerprint = inspect_wav(path)
     print(f"диаризую {path.name} …")
     turns = diarize(path)
     if not turns:
         print("  спикеры не найдены")
-        # маркер обязателен: без него ночной конвейер берёт файл каждый тик
-        # ВЕЧНО (очередь может застрять на одном шумовом файле)
-        out.write_text(f"# Разговор {path.stem}: речи не найдено\n", encoding="utf-8")
-        # тихие потери — в журнал, чтобы их было видно, а не «файл просто исчез»
+        # маркер обязателен: без него diar_job берёт файл каждый тик ВЕЧНО
+        # (застревание 13-19.07: очередь стояла на одном шумовом файле)
+        write_for_wav(
+            path, [], coverage_status="no_speech",
+            expected_source=source_fingerprint)
+        _publish_legacy_markdown(
+            path, _legacy_markdown(path.stem, [], [], "речи не найдено"))
+        # R1-8: тихие потери — в журнал, чтобы их было видно, а не «файл просто исчез»
         import datetime as _dt
         with (VOICES / "no_speech.log").open("a", encoding="utf-8") as log:
             log.write(f"{_dt.datetime.now().isoformat(timespec='seconds')} {path.name}\n")
@@ -389,51 +477,80 @@ def process(path: Path, ref: Path) -> bool:
     turns = merge_speakers(path, turns, embs=embs, protected=set(named))
     names = label_speakers(turns, named)
     export_embeddings(path.stem, turns, embs, names)  # сырьё для voice_learn
-    lines = []
+    evidence_turns = []
+    partial = False
     for start, end, spk in merge_turns(turns):
         if end - start < 1.0:
+            partial = True
             continue
         try:
-            text = transcribe_span(path, start - 0.25, end + 0.4)
+            pcm_window = _stt_pcm_window(path, start - 0.25, end + 0.4)
+            if pcm_window.end_sample <= pcm_window.start_sample:
+                partial = True
+                continue
+            text = transcribe_span(
+                path, start - 0.25, end + 0.4, pcm_window=pcm_window)
         except Exception as e:
-            print(f"  span {start:.0f}s: ошибка STT: {e}")
+            print(f"  span {start:.0f}s: ошибка whisper: {e}")
+            partial = True
             continue
         if not text or is_hallucination(text):
+            partial = True
             continue
         name = names.get(spk, "Голос ?")
-        if lines and lines[-1][0] == name:
-            lines[-1][1].append(text)
-        else:
-            lines.append([name, [text]])
-    if not lines:
+        # Evidence stays 1:1 with an actual STT request.  Human Markdown may
+        # merge adjacent labels below, but the canonical quote never claims a
+        # bounding interval that included audio not sent in that request.
+        evidence_turns.append({
+            "speaker_label": name, "text": text,
+            "start_sample": pcm_window.start_sample,
+            "end_sample": pcm_window.end_sample,
+        })
+    if not evidence_turns:
         print("  внятной речи не найдено")
-        out.write_text(f"# Разговор {path.stem}: внятной речи не найдено\n", encoding="utf-8")
+        write_for_wav(
+            path, [], coverage_status="partial" if partial else "no_clear_speech",
+            expected_source=source_fingerprint)
+        _publish_legacy_markdown(
+            path, _legacy_markdown(
+                path.stem, [], [], "внятной речи не найдено"))
         return False
     # эхо на стыках: хвост фразы соседа попадает в расширенный отрезок и звучит
-    # дважды — одна и та же фраза у обоих участников (поймано аудитом расшифровок)
-    pairs = [(n, " ".join(parts)) for n, parts in lines]
-    clean = _dedupe_echo(pairs)
-    if len(clean) != len(pairs) or any(a[1] != b[1] for a, b in zip(pairs, clean)):
-        print(f"  эхо на стыках подчищено: было {len(pairs)} реплик, стало {len(clean)}")
-    md = "\n\n".join(f"**{n}:** {t}" for n, t in clean)
+    # дважды — «Ага, но он его не вставил, да?» и у Димы, и у второго носителя (аудит 06.08)
+    markdown_pairs = _dedupe_echo([
+        (turn["speaker_label"], turn["text"]) for turn in evidence_turns])
+    if (len(markdown_pairs) != len(evidence_turns)
+            or any(pair != (turn["speaker_label"], turn["text"])
+                   for pair, turn in zip(markdown_pairs, evidence_turns))):
+        print(f"  эхо на стыках подчищено: было {len(evidence_turns)} реплик, "
+              f"стало {len(markdown_pairs)}")
+    markdown_turns = [
+        {"speaker_label": speaker, "text": text}
+        for speaker, text in markdown_pairs
+    ]
     stamp = path.stem
-    header = f"# Разговор {stamp} (диаризация)\n\nУчастники: {', '.join(dict.fromkeys(names.values()))}\n\n"
-    out.write_text(header + md + "\n", encoding="utf-8")
-    if INBOX.exists():
-        (INBOX / f"{stamp}_diarized.md").write_text(header + md + "\n", encoding="utf-8")
-        mark_webhook_duplicates(stamp)
-    print(f"  готово: {out.name}, спикеров {len(set(names.values()))}, реплик {len(lines)}")
+    write_for_wav(
+        path, evidence_turns,
+        coverage_status="partial" if partial else "complete",
+        expected_source=source_fingerprint)
+    _publish_legacy_markdown(
+        path, _legacy_markdown(
+            stamp, list(dict.fromkeys(names.values())), markdown_turns))
+    print(f"  готово: {out.name}, спикеров {len(set(names.values()))}, "
+          f"реплик {len(evidence_turns)}")
     return True
 
 
 def mark_webhook_duplicates(stamp: str) -> None:
-    """Дедуп карточек: тот же разговор приходит и вебхуком приложения (их STT,
-    хуже), и нашей диаризацией. Диаризованная версия главнее: вебхук-файлы из
-    временного окна записи помечаются разобранными — ночной разбор видит
-    разговор один раз. Нет диаризации — вебхук остаётся резервом."""
+    """Дедуп карточек (A5): тот же разговор приходит и legacy-вебхуком (его STT хуже),
+    и нашей диаризацией. Диаризованная версия главнее: вебхук-файлы из временного
+    окна записи помечаются разобранными — ночной разбор видит разговор один раз.
+    Нет диаризации — вебхук остаётся резервом и разбирается как раньше."""
     from datetime import datetime, timedelta
     try:
-        start = datetime.strptime(stamp, "%Y-%m-%d_%H%M%S")
+        # Synced NAND files carry an idempotency suffix after the timestamp;
+        # use the same capture window for webhook dedup as ordinary live WAVs.
+        start = datetime.strptime(stamp[:17], "%Y-%m-%d_%H%M%S")
         with wave.open(str(AUDIO_DIR / f"{stamp}.wav")) as w:
             dur = w.getnframes() / w.getframerate()
     except Exception:
@@ -466,11 +583,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("wav", nargs="?", help="WAV-файл")
     ap.add_argument("--all", action="store_true", help="все необработанные из audio/")
-    ap.add_argument("--ref", default=str(REF_DEFAULT), help="эталон голоса владельца")
-    # мультибазы: у второго носителя своя база — расшифровка должна лечь
-    # в его INBOX, а не в дневник владельца
+    ap.add_argument("--ref", default=str(REF_DEFAULT), help="эталон голоса Димы")
+    # мультибазы (C5): у второго носителя своя база — расшифровка должна лечь
+    # в его INBOX, а не в дневник Димы
     ap.add_argument("--inbox", default=None, help="куда класть копию расшифровки")
-    # своя библиотека голосов на носителя: иначе люди из окружения владельца
+    # своя библиотека голосов на носителя: иначе люди из окружения Димы
     # начнут «узнаваться» в чужих разговорах — это утечка знания о нём
     ap.add_argument("--voices", default=None, help="библиотека голосов носителя")
     args = ap.parse_args()
@@ -485,7 +602,7 @@ def main():
         VOICES.mkdir(parents=True, exist_ok=True)
         EMB_DIR.mkdir(parents=True, exist_ok=True)
     if not HF_TOKEN:
-        sys.exit("HF_TOKEN не задан в .env")
+        sys.exit("HF_TOKEN не задан в .env — см. handover/RUNBOOK.md, «Диаризация»")
     ref = Path(args.ref)
     if args.all:
         import time

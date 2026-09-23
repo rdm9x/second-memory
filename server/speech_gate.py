@@ -1,9 +1,9 @@
 """Детектор речи для моста: всплеск над СОБСТВЕННЫМ шумовым полом потока.
 
-Зачем отдельный файл. Старый детектор (`is_silence` в audio_bridge_core.py) усреднял
+Зачем отдельный файл. Старый детектор аудиомоста (`is_silence`) усреднял
 амплитуду по ВСЕМУ 8-секундному куску и сравнивал с общей константой 500.
 Пока кулон резал тишину сам (VAD на плате), в мост приходила почти сплошная
-речь и константа работала. С непрерывным захватом (PORT-7, как сток Pomnit) в
+речь и константа работа. С непрерывным захватом PORT-7 в
 мост идёт и фон комнаты, и тогда константа ломается сразу с двух сторон:
 
 - в ТИХОЙ переговорной (шумовой пол ~110) редкая дальняя речь тонет в среднем
@@ -11,11 +11,11 @@
   Живой замер на совещании 26.08: при 1 с речи на кусок терялось 65 % кусков,
   при 0,5 с — 97 %. Это дырки в расшифровке И ложное закрытие wav (тихие
   куски копят счётчик 90 с);
-- в ОБЫЧНОЙ комнате (пол ~850-1000) и у платы первого поколения (пол ~2200) фон САМ
+- в ОБЫЧНОЙ комнате (пол ~850-1000) и у старой платы второго носителя (пол ~2200) фон САМ
   выше 500, поэтому тишины не бывает НИКОГДА: разговор не закрывается вовсе,
   а в STT круглосуточно едет пустая комната и рождает галлюцинации.
 
-Замеры 26.08: шумовой пол зависит не
+Замеры 26.08 (roles/backend/METHODS.md, «Слух моста»): шумовой пол зависит не
 от платы, а от КОМНАТЫ, и гуляет вдесятеро у одного и того же кулона за один
 день — 110 в тихой переговорной против 995 в другой записи. Поэтому никакая
 константа (даже отдельная на носителя) не годится: порог должен считаться от
@@ -30,7 +30,7 @@
 4. речь = хотя бы MIN_WINS окон, которые выше фона в RATIO раз.
 
 ГРАБЛЯ, пойманная на замерах 26.08 (не повторять): «поднимать пол только по
-НЕречевому куску» кажется разумным, но ЗАЛИПАЕТ намертво. Владелец выходит из
+НЕречевому куску» кажется разумным, но ЗАЛИПАЕТ намертво. Дима выходит из
 тихой переговорной (пол 141) в шумную комнату — там КАЖДЫЙ кусок выше старого
 порога, значит каждый считается речью, значит пол не поднимается никогда.
 Замер: пол застревал на 141 навсегда, тишины не находилось ВООБЩЕ (0 % кусков),
@@ -38,7 +38,7 @@
 ВСЕГДА. Вторая страховка — `reset()` при закрытии разговора: новый разговор
 учит фон заново, с первого куска.
 
-Состояние (фон) — СВОЁ на носителя: у каждого своя комната и своя плата.
+Состояние (фон) — СВОЁ на носителя: у второго носителя своя комната и своя плата.
 Все пороги переопределяются через .env, без правки кода.
 """
 import math
@@ -49,25 +49,29 @@ try:                       # C-скорость; в Python 3.13 модуль у�
 except Exception:          # pragma: no cover — запасной путь на будущее
     audioop = None
 
-SAMPLE_RATE = int(os.environ.get("AUDIO_BRIDGE_SAMPLE_RATE", 16000))
+def _setting(name: str, legacy: str, default):
+    return os.environ.get(name, os.environ.get(legacy, default))
+
+
+SAMPLE_RATE = int(_setting("AUDIO_BRIDGE_SAMPLE_RATE", "AUDIO_BRIDGE_SAMPLE_RATE", 16000))
 
 # Окно 100 мс: короче — шумит на отдельных слогах, длиннее — теряет короткие реплики.
-WIN_MS = int(os.environ.get("AUDIO_BRIDGE_GATE_WIN_MS", 100))
+WIN_MS = int(_setting("AUDIO_BRIDGE_GATE_WIN_MS", "AUDIO_BRIDGE_GATE_WIN_MS", 100))
 # Во сколько раз окно должно превысить фон, чтобы считаться речью.
-RATIO = float(os.environ.get("AUDIO_BRIDGE_GATE_RATIO", 2.2))
+RATIO = float(_setting("AUDIO_BRIDGE_GATE_RATIO", "AUDIO_BRIDGE_GATE_RATIO", 2.2))
 # Добавка к порогу — страховка на случай очень тихого фона (тихая переговорная,
 # где пол ~110: без добавки порогом стало бы 240 и в речь пролезал бы шорох).
-MARGIN = float(os.environ.get("AUDIO_BRIDGE_GATE_MARGIN", 310))
+MARGIN = float(_setting("AUDIO_BRIDGE_GATE_MARGIN", "AUDIO_BRIDGE_GATE_MARGIN", 310))
 # Ниже этого RMS речи не бывает ни при каком фоне (защита от «цифровой тишины»).
-ABS_MIN = float(os.environ.get("AUDIO_BRIDGE_GATE_ABS_MIN", 250))
+ABS_MIN = float(_setting("AUDIO_BRIDGE_GATE_ABS_MIN", "AUDIO_BRIDGE_GATE_ABS_MIN", 250))
 # Сколько окон должно быть «громкими»: 4 окна = 0,4 с речи в 8-секундном куске.
-MIN_WINS = int(os.environ.get("AUDIO_BRIDGE_GATE_MIN_WINS", 4))
+MIN_WINS = int(_setting("AUDIO_BRIDGE_GATE_MIN_WINS", "AUDIO_BRIDGE_GATE_MIN_WINS", 4))
 # Скорость слежения за фоном: вниз быстро, вверх медленно.
-DOWN = float(os.environ.get("AUDIO_BRIDGE_GATE_DOWN", 0.35))
-UP = float(os.environ.get("AUDIO_BRIDGE_GATE_UP", 0.08))
+DOWN = float(_setting("AUDIO_BRIDGE_GATE_DOWN", "AUDIO_BRIDGE_GATE_DOWN", 0.35))
+UP = float(_setting("AUDIO_BRIDGE_GATE_UP", "AUDIO_BRIDGE_GATE_UP", 0.08))
 # Границы фона — чтобы оценка не убежала ни в ноль, ни в бесконечность.
-FLOOR_MIN = float(os.environ.get("AUDIO_BRIDGE_GATE_FLOOR_MIN", 50))
-FLOOR_MAX = float(os.environ.get("AUDIO_BRIDGE_GATE_FLOOR_MAX", 5000))
+FLOOR_MIN = float(_setting("AUDIO_BRIDGE_GATE_FLOOR_MIN", "AUDIO_BRIDGE_GATE_FLOOR_MIN", 50))
+FLOOR_MAX = float(_setting("AUDIO_BRIDGE_GATE_FLOOR_MAX", "AUDIO_BRIDGE_GATE_FLOOR_MAX", 5000))
 
 
 def window_rms(pcm: bytes, win_ms: int = WIN_MS) -> list[float]:
