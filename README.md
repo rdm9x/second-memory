@@ -16,13 +16,13 @@
 на нейтральный. Это не фотографии серийного изделия.
 
 > Публичная техническая витрина действующего прототипа. Здесь показаны файлы обработки
-> звука и базовая прошивка. Личные записи, база памяти, секреты, мобильное приложение и
+> звука. Прошивка кулона — отдельная аппаратная линия, в витрину не входит. Личные записи, база памяти, секреты, мобильное приложение и
 > полный серверный код в этот репозиторий не входят — они живут в закрытых репозиториях
 > (`second-memory-app`, `pomnit-server`), доступ проверяющим предоставляется по запросу.
 
 ## Состояние на 23.09.2026
 
-- **Приложение** (iOS, форк pomnit под MIT, сборка 1.0.543/1001): запись с кулона и с микрофона
+- **Приложение** (iOS, построено на открытом коде под MIT и переработано под «Помнит», сборка 1.0.543/1001): запись с кулона и с микрофона
   телефона, живая расшифровка, Лента разговоров, Дела, Летопись, Чат с памятью, «Нити» и
   «Чертоги» — два вида одной связанной памяти; экран памяти кулона с режимами слива.
 - **Кулон**: плата Seeed XIAO nRF54L15 Sense, Opus 16 кГц по BLE, вызов ассистента двойным
@@ -39,7 +39,7 @@
 flowchart LR
     P["Кулон\nnRF54L15, микрофон, NAND 256 МБ\nOpus, BLE"]
     P -- "BLE: поток / слив памяти" --> T["Телефон\nприложение Помнит"]
-    T -- "WebSocket, opus-фреймы" --> B["Аудиомост\naudio_bridge_core.py"]
+    T -- "WebSocket, opus-фреймы" --> B["Аудиомост\nserver/"]
     T -- "файлы памяти кулона" --> B
     B --> S["GigaAM STT\nлокально, GPU"]
     S --> B
@@ -52,7 +52,7 @@ flowchart LR
     A <--> TG["Telegram"]
 ```
 
-- **Аудиомост** (`server/audio_bridge_core.py`) — принимает поток и файлы, режет на куски, отделяет
+- **Аудиомост** (модуль в `server/`) — принимает поток и файлы, режет на куски, отделяет
   речь от тишины порогом от собственного шумового пола (`speech_gate.py`), гоняет через STT,
   возвращает живую расшифровку на телефон, пишет WAV для разметки, ловит голосовые команды
   («Ватсон, поставь напоминание…»). Записи хранятся бессрочно, диск защищён от переполнения.
@@ -71,8 +71,6 @@ flowchart LR
 ```
 server/     аудиомост, детектор речи, фильтр галлюцинаций, GigaAM-сервер, диаризация
             (актуальные версии; имена окружения заменены на примеры)
-firmware/   базовая Zephyr-прошивка кулона (август 2026) и конвейер сборки/заливки;
-            версия с буфером памяти NAND — в закрытом контуре
 hardware/   фотографии нынешнего корпуса
 ```
 
@@ -86,7 +84,7 @@ hardware/   фотографии нынешнего корпуса
 Pomnit is a wearable pendant and an app that turn conversations into transcripts, summaries,
 action items, a dated life chronicle and linked memory ("threads" and "rooms"). The photos above
 show the real hand-built wooden and aluminum enclosure. This public repository is a technical
-showcase (audio processing files and the baseline firmware); the app and the full server live
+showcase (audio processing files); the app, the firmware and the full server live
 in private repositories and contain no personal recordings or the private memory database.
 
 Все права защищены / All rights reserved.
